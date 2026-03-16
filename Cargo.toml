@@ -18,7 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", features = ["signal", "process", "resource", "fs"] }
+nix = { version = "0.28", features = ["signal", "process", "resource", "fs", "user"] }
 libc = "0.2"
 
 [dev-dependencies]

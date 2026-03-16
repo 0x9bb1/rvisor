@@ -28,9 +28,13 @@ pub fn spawn_program(
             // Ask the kernel to send SIGKILL to this child (and its entire process
             // group) when the supervisor process dies for any reason, including
             // SIGKILL or a crash.  This prevents orphaned processes.
-            let ret = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error());
+            // prctl(PR_SET_PDEATHSIG) is Linux-only; macOS lacks it.
+            #[cfg(target_os = "linux")]
+            {
+                let ret = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
