@@ -763,7 +763,7 @@ fn apply_umask(umask: Option<u32>) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if let Some(value) = umask {
-            let mask = nix::sys::stat::Mode::from_bits_truncate(value);
+            let mask = nix::sys::stat::Mode::from_bits_truncate(value as libc::mode_t);
             nix::sys::stat::umask(mask);
         }
     }
