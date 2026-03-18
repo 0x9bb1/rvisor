@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use rvisor::{config, ipc, service, supervisor};
+use rvisor::{actor, config, ipc, service, supervisor};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 fn write_config(path: &Path, content: &str) {
@@ -43,26 +41,20 @@ command = '{escaped_command}'
 
 async fn start_daemon(config_path: &Path) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let config = config::load(Some(config_path))?;
-    let supervisor = Arc::new(Mutex::new(supervisor::Supervisor::new_from_config(
+    let sock_path = config.supervisord.sock_path.clone();
+    let allowed_uids = config.supervisord.allowed_uids.clone();
+    // spawn_actor handles autostart internally (with expanded numprocs names)
+    let handle = actor::spawn_actor(
         config_path.to_path_buf(),
         config.programs.clone(),
         std::collections::HashMap::new(),
         config.supervisord.pidfile.clone(),
         config.supervisord.sock_path.clone(),
         config.supervisord.logfile.clone(),
-    )));
-    let autostart = {
-        let guard = supervisor.lock().await;
-        guard.autostart_programs()
-    };
-    for name in autostart {
-        supervisor::start_program(supervisor.clone(), &name).await?;
-    }
-    let sock_path = config.supervisord.sock_path.clone();
+    );
     let sock_path_run = sock_path.clone();
-    let allowed_uids = config.supervisord.allowed_uids.clone();
-    let handle = tokio::spawn(async move {
-        let _ = ipc::run_server(&sock_path_run, supervisor, allowed_uids).await;
+    let server_handle = tokio::spawn(async move {
+        let _ = ipc::run_server(&sock_path_run, handle, allowed_uids).await;
     });
     for _ in 0..20 {
         if sock_path.exists() {
@@ -70,7 +62,7 @@ async fn start_daemon(config_path: &Path) -> anyhow::Result<tokio::task::JoinHan
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(handle)
+    Ok(server_handle)
 }
 
 async fn request(sock_path: &Path, command: &str, program: Option<&str>) -> ipc::Response {
@@ -1882,15 +1874,12 @@ async fn update_removes_program_deleted_from_config() {
         serde_json::from_value(response.data.unwrap()).unwrap();
     assert!(summary.removed.contains(&"todelete".to_string()));
 
-    // Program is stopped after removal from config
+    // Program is fully removed from the supervisor after update.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let status_resp = request(&sock_path, "status", Some("todelete")).await;
     let statuses: Vec<supervisor::ProgramStatus> =
         serde_json::from_value(status_resp.data.unwrap()).unwrap();
-    assert_eq!(statuses[0].state, "STOPPED");
-    // NOTE: update() stops but does not purge removed programs from the
-    // internal map; they remain visible in avail() as STOPPED entries.
-    // Use `ctl remove` (remove_program) to fully purge a program.
+    assert!(statuses.is_empty(), "removed program should not appear in status");
 
     handle.abort();
 }

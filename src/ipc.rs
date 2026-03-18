@@ -1,11 +1,10 @@
-use crate::supervisor;
+use crate::actor;
+use crate::config;
 use anyhow::Context;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use futures::{SinkExt, StreamExt};
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -45,7 +44,7 @@ pub struct LogTailReply {
 
 pub async fn run_server(
     sock_path: &Path,
-    supervisor: Arc<Mutex<supervisor::Supervisor>>,
+    handle: actor::RvisorHandle,
     allowed_uids: Vec<u32>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = sock_path.parent() {
@@ -71,11 +70,11 @@ pub async fn run_server(
         Err(e) => return Err(e).with_context(|| format!("bind socket {}", sock_path.display())),
     };
     tracing::info!("listening on {}", sock_path.display());
-    let allowed_uids = Arc::new(allowed_uids);
+    let allowed_uids = std::sync::Arc::new(allowed_uids);
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let supervisor = supervisor.clone();
+        let handle = handle.clone();
         let allowed = allowed_uids.clone();
         tokio::spawn(async move {
             // Check peer credentials when an allow-list is configured.
@@ -92,7 +91,7 @@ pub async fn run_server(
                     return;
                 }
             }
-            if let Err(err) = handle_stream(stream, supervisor).await {
+            if let Err(err) = handle_stream(stream, handle).await {
                 tracing::warn!("ipc error: {err}");
             }
         });
@@ -141,20 +140,20 @@ pub async fn send_stream_request(
 
 async fn handle_stream(
     stream: UnixStream,
-    supervisor: Arc<Mutex<supervisor::Supervisor>>,
+    handle: actor::RvisorHandle,
 ) -> anyhow::Result<()> {
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
     while let Some(frame) = framed.next().await {
         let frame = frame?;
         let request: Request = serde_json::from_slice(&frame)?;
         if request.command == "logtail" && request.follow == Some(true) {
-            handle_logtail_stream(&mut framed, request, supervisor.clone()).await?;
+            handle_logtail_stream(&mut framed, request, handle.clone()).await?;
             break;
         } else if request.command == "events" {
-            handle_events_stream(&mut framed, supervisor.clone()).await?;
+            handle_events_stream(&mut framed, handle.clone()).await?;
             break;
         } else {
-            let response = handle_request(request, supervisor.clone()).await;
+            let response = handle_request(request, handle.clone()).await;
             let payload = serde_json::to_vec(&response)?;
             framed.send(Bytes::from(payload)).await?;
         }
@@ -164,86 +163,115 @@ async fn handle_stream(
 
 async fn handle_request(
     request: Request,
-    supervisor: Arc<Mutex<supervisor::Supervisor>>,
+    handle: actor::RvisorHandle,
 ) -> Response {
     match request.command.as_str() {
         "status" => {
-            let guard = supervisor.lock().await;
-            let statuses = guard.status(request.program.as_deref());
-            Response {
-                ok: true,
-                message: "ok".to_string(),
-                data: serde_json::to_value(statuses).ok(),
+            match handle.status(request.program).await {
+                Ok(statuses) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(statuses).ok(),
+                },
+                Err(e) => Response {
+                    ok: false,
+                    message: e.to_string(),
+                    data: None,
+                },
             }
         }
         "start" => {
-            let result = if let Some(name) = request.program {
-                supervisor::start_program(supervisor, &name).await
-            } else {
-                supervisor::start_all(supervisor).await
-            };
-            result_to_response(result)
+            result_to_response(handle.start(request.program).await)
         }
         "restart" => {
-            let result = if let Some(name) = request.program {
-                supervisor::restart_program(supervisor, &name).await
-            } else {
-                match supervisor::stop_all(supervisor.clone()).await {
-                    Ok(_) => supervisor::start_all(supervisor).await,
-                    Err(err) => Err(err),
-                }
-            };
-            result_to_response(result)
+            result_to_response(handle.restart(request.program).await)
         }
         "stop" => {
-            let result = if let Some(name) = request.program {
-                supervisor::stop_program(supervisor, &name).await
-            } else {
-                supervisor::stop_all(supervisor).await
-            };
-            result_to_response(result)
+            result_to_response(handle.stop(request.program).await)
         }
-        "reread" => match supervisor::reread(supervisor).await {
-            Ok(summary) => Response {
-                ok: true,
-                message: "ok".to_string(),
-                data: serde_json::to_value(summary).ok(),
-            },
-            Err(err) => Response {
-                ok: false,
-                message: err.to_string(),
-                data: None,
-            },
-        },
-        "update" => match supervisor::update(supervisor).await {
-            Ok(summary) => Response {
-                ok: true,
-                message: "ok".to_string(),
-                data: serde_json::to_value(summary).ok(),
-            },
-            Err(err) => Response {
-                ok: false,
-                message: err.to_string(),
-                data: None,
-            },
-        },
-        "reload" => match supervisor::reload(supervisor).await {
-            Ok(summary) => Response {
-                ok: true,
-                message: "ok".to_string(),
-                data: serde_json::to_value(summary).ok(),
-            },
-            Err(err) => Response {
-                ok: false,
-                message: err.to_string(),
-                data: None,
-            },
-        },
-        "pid" => Response {
-            ok: true,
-            message: "ok".to_string(),
-            data: serde_json::to_value(std::process::id()).ok(),
-        },
+        "reread" => {
+            let config_path = handle.config_path.clone();
+            let config = match tokio::task::spawn_blocking(move || config::load(Some(&config_path)))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))
+                .and_then(|r| r)
+            {
+                Ok(c) => c,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
+            };
+            match handle.reread(config).await {
+                Ok(summary) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(summary).ok(),
+                },
+                Err(err) => Response {
+                    ok: false,
+                    message: err.to_string(),
+                    data: None,
+                },
+            }
+        }
+        "update" => {
+            let config_path = handle.config_path.clone();
+            let config = match tokio::task::spawn_blocking(move || config::load(Some(&config_path)))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))
+                .and_then(|r| r)
+            {
+                Ok(c) => c,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
+            };
+            match handle.update(config).await {
+                Ok(summary) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(summary).ok(),
+                },
+                Err(err) => Response {
+                    ok: false,
+                    message: err.to_string(),
+                    data: None,
+                },
+            }
+        }
+        "reload" => {
+            let config_path = handle.config_path.clone();
+            let config = match tokio::task::spawn_blocking(move || config::load(Some(&config_path)))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))
+                .and_then(|r| r)
+            {
+                Ok(c) => c,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
+            };
+            match handle.reload(config).await {
+                Ok(summary) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(summary).ok(),
+                },
+                Err(err) => Response {
+                    ok: false,
+                    message: err.to_string(),
+                    data: None,
+                },
+            }
+        }
+        "pid" => {
+            match handle.pid().await {
+                Ok(pid) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(pid).ok(),
+                },
+                Err(e) => Response {
+                    ok: false,
+                    message: e.to_string(),
+                    data: None,
+                },
+            }
+        }
         "signal" => {
             let Some(signal) = request.signal else {
                 return Response {
@@ -252,19 +280,12 @@ async fn handle_request(
                     data: None,
                 };
             };
-            let result = if let Some(name) = request.program {
-                supervisor::signal_program(supervisor, &name, &signal).await
-            } else {
-                supervisor::signal_all(supervisor, &signal).await
-            };
-            result_to_response(result)
+            result_to_response(handle.signal(request.program, signal).await)
         }
         "shutdown" => {
-            let supervisor_clone = supervisor.clone();
+            let handle_clone = handle.clone();
             tokio::spawn(async move {
-                let _ = supervisor::shutdown(supervisor_clone).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                std::process::exit(0);
+                let _ = handle_clone.shutdown().await;
             });
             Response {
                 ok: true,
@@ -285,36 +306,21 @@ async fn handle_request(
             let offset = request.offset.unwrap_or(0);
             let bytes = request.bytes;
             let since = request.since;
-            let log_path = {
-                let guard = supervisor.lock().await;
-                let Some(config) = guard.program_config(&name) else {
-                    return Response {
-                        ok: false,
-                        message: format!("unknown program {name}"),
-                        data: None,
-                    };
-                };
-                match stream.as_str() {
-                    "stderr" => config.stderr_log.clone(),
-                    _ => config.stdout_log.clone(),
-                }
+
+            let path = match handle.log_path(name.clone(), stream).await {
+                Ok(p) => p,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
             };
-            match log_path {
-                Some(path) => match read_tail_lines(&path, lines, offset, bytes, since).await {
-                    Ok(reply) => Response {
-                        ok: true,
-                        message: "ok".to_string(),
-                        data: serde_json::to_value(reply).ok(),
-                    },
-                    Err(err) => Response {
-                        ok: false,
-                        message: err.to_string(),
-                        data: None,
-                    },
+
+            match read_tail_lines(&path, lines, offset, bytes, since).await {
+                Ok(reply) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(reply).ok(),
                 },
-                None => Response {
+                Err(err) => Response {
                     ok: false,
-                    message: "log file is not configured".to_string(),
+                    message: err.to_string(),
                     data: None,
                 },
             }
@@ -324,9 +330,9 @@ async fn handle_request(
             let offset = request.offset.unwrap_or(0);
             let bytes = request.bytes;
             let since = request.since;
-            let log_path = {
-                let guard = supervisor.lock().await;
-                guard.logfile().cloned()
+            let log_path = match handle.main_log_path().await {
+                Ok(p) => p,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
             };
             match log_path {
                 Some(path) => match read_tail_lines(&path, lines, offset, bytes, since).await {
@@ -349,16 +355,21 @@ async fn handle_request(
             }
         }
         "avail" => {
-            let names = supervisor::avail(supervisor).await;
-            Response {
-                ok: true,
-                message: "ok".to_string(),
-                data: serde_json::to_value(names).ok(),
+            match handle.avail().await {
+                Ok(names) => Response {
+                    ok: true,
+                    message: "ok".to_string(),
+                    data: serde_json::to_value(names).ok(),
+                },
+                Err(e) => Response {
+                    ok: false,
+                    message: e.to_string(),
+                    data: None,
+                },
             }
         }
         "clear" => {
-            let result = supervisor::clear_logs(supervisor, request.program.as_deref()).await;
-            result_to_response(result)
+            result_to_response(handle.clear(request.program).await)
         }
         "add" => {
             let Some(name) = request.program else {
@@ -368,8 +379,16 @@ async fn handle_request(
                     data: None,
                 };
             };
-            let result = supervisor::add_program(supervisor, &name).await;
-            result_to_response(result)
+            let config_path = handle.config_path.clone();
+            let config = match tokio::task::spawn_blocking(move || config::load(Some(&config_path)))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))
+                .and_then(|r| r)
+            {
+                Ok(c) => c,
+                Err(e) => return Response { ok: false, message: e.to_string(), data: None },
+            };
+            result_to_response(handle.add(name, config).await)
         }
         "remove" => {
             let Some(name) = request.program else {
@@ -379,8 +398,7 @@ async fn handle_request(
                     data: None,
                 };
             };
-            let result = supervisor::remove_program(supervisor, &name).await;
-            result_to_response(result)
+            result_to_response(handle.remove(name).await)
         }
         _ => Response {
             ok: false,
@@ -476,7 +494,7 @@ async fn read_tail_lines(
 async fn handle_logtail_stream(
     framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
     request: Request,
-    supervisor: Arc<Mutex<supervisor::Supervisor>>,
+    handle: actor::RvisorHandle,
 ) -> anyhow::Result<()> {
     let Some(name) = request.program else {
         let response = Response {
@@ -489,36 +507,23 @@ async fn handle_logtail_stream(
         return Ok(());
     };
     let lines = request.lines.unwrap_or(10);
-    let stream = request.stream.unwrap_or_else(|| "stdout".to_string());
+    let stream_name = request.stream.unwrap_or_else(|| "stdout".to_string());
     let mut offset = request.offset.unwrap_or(0);
     let bytes = request.bytes;
     let since = request.since;
-    let log_path = {
-        let guard = supervisor.lock().await;
-        let Some(config) = guard.program_config(&name) else {
+
+    let path = match handle.log_path(name.clone(), stream_name).await {
+        Ok(p) => p,
+        Err(e) => {
             let response = Response {
                 ok: false,
-                message: format!("unknown program {name}"),
+                message: e.to_string(),
                 data: None,
             };
             let payload = serde_json::to_vec(&response)?;
             let _ = framed.send(Bytes::from(payload)).await;
             return Ok(());
-        };
-        match stream.as_str() {
-            "stderr" => config.stderr_log.clone(),
-            _ => config.stdout_log.clone(),
         }
-    };
-    let Some(path) = log_path else {
-        let response = Response {
-            ok: false,
-            message: "log file is not configured".to_string(),
-            data: None,
-        };
-        let payload = serde_json::to_vec(&response)?;
-        let _ = framed.send(Bytes::from(payload)).await;
-        return Ok(());
     };
 
     if let Ok(reply) = read_tail_lines(&path, lines, offset, bytes, since).await {
@@ -575,11 +580,20 @@ async fn handle_logtail_stream(
 
 async fn handle_events_stream(
     framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
-    supervisor: Arc<Mutex<supervisor::Supervisor>>,
+    handle: actor::RvisorHandle,
 ) -> anyhow::Result<()> {
-    let mut rx = {
-        let guard = supervisor.lock().await;
-        guard.events()
+    let mut rx = match handle.events_subscribe().await {
+        Ok(rx) => rx,
+        Err(e) => {
+            let response = Response {
+                ok: false,
+                message: e.to_string(),
+                data: None,
+            };
+            let payload = serde_json::to_vec(&response)?;
+            let _ = framed.send(Bytes::from(payload)).await;
+            return Ok(());
+        }
     };
     while let Ok(event) = rx.recv().await {
         let response = Response {

@@ -1,10 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::io::Write;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
-use rvisor::{config, ipc, logging, service, supervisor};
+use rvisor::{actor, config, ipc, logging, service, supervisor};
 
 #[derive(Parser, Debug)]
 #[command(name = "supervisord", version, about = "Rust-based supervisor daemon")]
@@ -229,26 +227,21 @@ async fn run_async(args: Args, config_path: PathBuf) -> anyhow::Result<()> {
         write_pidfile(pidfile)?;
     }
     let global_env = load_env_file(args.env_file.as_deref())?;
-    let supervisor = Arc::new(Mutex::new(supervisor::Supervisor::new_from_config(
+
+    let handle = actor::spawn_actor(
         config_path,
         config.programs.clone(),
         global_env,
         config.supervisord.pidfile.clone(),
         config.supervisord.sock_path.clone(),
         config.supervisord.logfile.clone(),
-    )));
-    let autostart = {
-        let guard = supervisor.lock().await;
-        guard.autostart_programs()
-    };
-    for name in autostart {
-        supervisor::start_program(supervisor.clone(), &name).await?;
-    }
+    );
+    // spawn_actor internally handles autostart (with expanded numprocs names)
 
     let sock_path = config.supervisord.sock_path.clone();
     let allowed_uids = config.supervisord.allowed_uids.clone();
-    setup_signal_handlers(supervisor.clone());
-    ipc::run_server(&sock_path, supervisor, allowed_uids).await?;
+    setup_signal_handlers(handle.clone());
+    ipc::run_server(&sock_path, handle, allowed_uids).await?;
     Ok(())
 }
 
@@ -848,19 +841,26 @@ fn write_pidfile(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_signal_handlers(supervisor: Arc<Mutex<supervisor::Supervisor>>) {
+fn setup_signal_handlers(handle: actor::RvisorHandle) {
     #[cfg(unix)]
     {
-        let sup_hup = supervisor.clone();
+        let handle_hup = handle.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             if let Ok(mut hup) = signal(SignalKind::hangup()) {
                 while hup.recv().await.is_some() {
-                    let _ = supervisor::update(sup_hup.clone()).await;
+                    let config_path = handle_hup.config_path.clone();
+                    if let Some(config) = tokio::task::spawn_blocking(move || config::load(Some(&config_path)))
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                    {
+                        let _ = handle_hup.update(config).await;
+                    }
                 }
             }
         });
-        let sup_shutdown = supervisor.clone();
+        let handle_shutdown = handle.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate()).ok();
@@ -872,7 +872,7 @@ fn setup_signal_handlers(supervisor: Arc<Mutex<supervisor::Supervisor>>) {
                     _ = async { if let Some(sig) = &mut sigint { sig.recv().await } else { None } } => {},
                     _ = async { if let Some(sig) = &mut sigquit { sig.recv().await } else { None } } => {},
                 }
-                let _ = supervisor::shutdown(sup_shutdown.clone()).await;
+                let _ = handle_shutdown.shutdown().await;
                 std::process::exit(0);
             }
         });
