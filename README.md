@@ -20,7 +20,13 @@ Build from source:
 cargo build
 ```
 
-Install the binary:
+Install from the local checkout:
+
+```bash
+cargo install --path .
+```
+
+Or install directly from Git:
 
 ```bash
 cargo install --git https://github.com/0x9bb1/rvisor.git
@@ -34,7 +40,7 @@ cargo test
 
 ## Quick Start
 
-Generate or copy a config:
+Generate or copy a config template:
 
 ```bash
 rvisor init -o supervisord.toml
@@ -60,6 +66,15 @@ Run it as a daemon instead:
 
 ```bash
 rvisor -c ./supervisord.toml --daemon run
+```
+
+A minimal edit-and-apply workflow looks like this:
+
+```bash
+$EDITOR ./supervisord.toml
+rvisor -c ./supervisord.toml ctl reread
+rvisor -c ./supervisord.toml ctl update
+rvisor -c ./supervisord.toml ctl status
 ```
 
 ## Example Config
@@ -140,12 +155,36 @@ If `-c` is omitted, `rvisor` searches for a config in this order:
 
 ## Service Management
 
-Install a user service:
+Manage a user service:
 
 ```bash
-rvisor service install
+rvisor -c ./supervisord.toml service install
 rvisor service start
 rvisor service status
+rvisor service enable
+rvisor service restart
 ```
 
-The service subcommands use `systemd --user` on Linux and `launchd` on macOS.
+The service subcommands use `systemd --user` on Linux and `launchd` on macOS. The implemented
+subcommands are `install`, `uninstall`, `start`, `stop`, `status`, `enable`, `disable`,
+`restart`, and `reload`.
+
+On Linux, `rvisor service install` writes `~/.config/systemd/user/rvisor.service` and points
+`ExecStart` at the current `rvisor` binary with `run` and the `-c` path you passed to install.
+A typical setup looks like this:
+
+```bash
+rvisor -c ~/.config/rvisor/supervisord.toml service install
+systemctl --user daemon-reload
+systemctl --user start rvisor.service
+systemctl --user status rvisor.service
+```
+
+On macOS, `rvisor service install` writes `~/Library/LaunchAgents/com.rvisor.plist` and uses
+`launchctl` under the hood for start and stop operations:
+
+```bash
+rvisor -c ~/.config/rvisor/supervisord.toml service install
+launchctl load ~/Library/LaunchAgents/com.rvisor.plist
+launchctl list com.rvisor
+```

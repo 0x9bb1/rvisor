@@ -36,7 +36,7 @@
 - `ctl` 子命令尽量对齐 `supervisorctl`：`status`、`start`、`stop`、`restart`、`reload`、`shutdown`、`signal`、`pid`、`logtail`。
 - `ctl` 可选参数：`-s/--serverurl`，`-u/--user`，`-P/--password`，`-v/--verbose`（保留兼容，即便默认本地 UDS）。
 - `init` 用于输出配置模板，参数：`-o/--output` 指定输出文件。
-- `service` 提供服务管理：`install`、`uninstall`、`start`、`stop`（目标为本机服务管理器，如 `systemd`/`launchd`）。
+- `service` 提供服务管理：`install`、`uninstall`、`start`、`stop`、`status`、`enable`、`disable`、`restart`、`reload`（目标为本机服务管理器，如 `systemd`/`launchd`）。
 - 输出格式默认人类可读；可加 `--json` 便于脚本解析。
 
 ## 状态与恢复

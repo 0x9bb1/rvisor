@@ -1,7 +1,14 @@
 [package]
 name = "rvisor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Rust-based process supervisor with a local IPC control plane"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/0x9bb1/rvisor"
+homepage = "https://github.com/0x9bb1/rvisor"
+keywords = ["supervisor", "daemon", "process", "ipc"]
+categories = ["command-line-utilities", "os::unix-apis"]
 
 [dependencies]
 anyhow = "1"

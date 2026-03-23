@@ -19,11 +19,11 @@ cargo test <test_name>
 
 ## Architecture
 
-rvisor is a Unix process supervisor daemon written in Rust. It is a single binary that acts as both the daemon (`supervisord run`) and the control client (`supervisord ctl <command>`).
+rvisor is a Unix process supervisor daemon written in Rust. It is a single binary that acts as both the daemon (`rvisor run`) and the control client (`rvisor ctl <command>`).
 
 ### IPC Model
 
-The daemon exposes a **Unix Domain Socket** (default `/tmp/supervisord.sock`). The protocol is **JSON over a length-delimited framing** (via `tokio-util` `LengthDelimitedCodec`). The CLI subcommands in `main.rs` connect to this socket and send/receive JSON.
+The daemon exposes a **Unix Domain Socket** (default `/tmp/rvisor.sock`). The protocol is **JSON over a length-delimited framing** (via `tokio-util` `LengthDelimitedCodec`). The CLI subcommands in `main.rs` connect to this socket and send/receive JSON.
 
 ### Key Modules
 
@@ -34,7 +34,7 @@ The daemon exposes a **Unix Domain Socket** (default `/tmp/supervisord.sock`). T
 | `ipc.rs` | Unix socket server (daemon side) and client helpers (CLI side); handles streaming for log-tail and event-feed commands; config file watching via `notify` |
 | `process.rs` | Spawns child processes via Tokio, captures stdout/stderr, size-based log rotation |
 | `config.rs` | TOML parsing into `SupervisordConfig` / `ProgramConfig`; config search path logic |
-| `service.rs` | systemd service install/uninstall/start/stop (Linux only) |
+| `service.rs` | service manager integration for `systemd --user` (Linux) and `launchd` (macOS) |
 | `logging.rs` | Initializes `tracing-subscriber` with `RUST_LOG` env filter (default: `info`) |
 
 ### Data Flow
@@ -50,25 +50,25 @@ CLI subcommand (main.rs)
 ### Configuration Format
 
 TOML (not INI like the original supervisord). Search order:
-1. `SUPERVISORD_RS_CONFIG` env var
+1. `RVISOR_CONFIG` env var
 2. `./supervisord.toml`, `./etc/supervisord.toml`
 3. `/etc/supervisord.toml`, `/etc/rvisor/supervisord.toml`, `/etc/supervisor/supervisord.toml`
 4. `../etc/supervisord.toml`, `../supervisord.toml` (relative to executable)
 
 ### Daemonization
 
-`supervisord -d run` performs the classic double-fork before starting the Tokio runtime. The child writes its PID to `pidfile` and redirects stdio. This logic lives at the top of `main.rs`.
+`rvisor -d run` performs the classic double-fork before starting the Tokio runtime. The child writes its PID to `pidfile` and redirects stdio. This logic lives at the top of `main.rs`.
 
 ### IPC Protocol
 
-`ipc::Request` fields: `command`, `program`, `lines`, `stream` (`stdout`/`stderr`), `follow`, `signal`, `offset`, `bytes`, `since`.
+`ipc::Request` fields: `command`, `program`, `lines`, `stream` (`stdout`/`stderr`), `follow`, `signal`, `offset`, `bytes`, and `since`.
 `ipc::Response` fields: `ok`, `message`, `data` (JSON value).
 
-Available `ctl` commands: `start`, `stop`, `restart`, `status`, `signal`, `reread`, `update`, `reload`, `shutdown`, `pid`, `logtail`, `tail`, `maintail`, `events`, `avail`, `clear`, `fg`.
+Available `ctl` commands: `start`, `stop`, `restart`, `status`, `signal`, `reread`, `update`, `reload`, `shutdown`, `pid`, `logtail`, `tail`, `maintail`, `events`, `avail`, `clear`, `add`, `remove`, `fg`, and `shell`.
 
 ### Config File Watching
 
-`ipc.rs` uses the `notify` crate to watch the config file for changes. On modification, it triggers an automatic `reread`+`update` cycle inside the daemon.
+`ipc.rs` uses the `notify` crate to watch the directory containing the config file. On modification of the active config file, it triggers an automatic `reread` + `update` cycle inside the daemon.
 
 ### Tests
 
