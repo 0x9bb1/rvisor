@@ -1,4 +1,5 @@
 use crate::config::{Autorestart, Config, ProgramConfig};
+use crate::persist;
 use crate::process;
 use crate::supervisor::expand_programs;
 use crate::supervisor::{
@@ -247,20 +248,63 @@ pub fn spawn_actor(
         programs,
         global_env,
         pidfile,
-        sock_path,
+        sock_path.clone(),
         logfile,
     );
-    // Get expanded autostart names before handing supervisor to the actor loop.
-    let autostart_names = supervisor.autostart_programs();
+
+    let state_path = persist::state_path(&sock_path);
+    let snapshot = persist::load_and_remove(&state_path);
+
+    // Seed the start list from config-driven autostart, then apply snapshot
+    // overrides: previously-running programs are (re)started even if autostart
+    // is false; explicitly-stopped programs are suppressed even if autostart
+    // is true.
+    let mut to_start: HashSet<String> = supervisor.autostart_programs().into_iter().collect();
+    if let Some(snap) = snapshot {
+        for entry in snap.programs {
+            if !supervisor.programs.contains_key(&entry.name) {
+                continue;
+            }
+            let Ok(state) = entry.state.parse::<ProgramState>() else {
+                continue;
+            };
+            match state {
+                ProgramState::Running | ProgramState::Starting | ProgramState::Backoff => {
+                    // Was running (or trying to run) — restart it.
+                    // On platforms without PR_SET_PDEATHSIG (macOS), the old
+                    // process may still be alive; kill it to avoid duplicates.
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(pid) = entry.pid {
+                        use crate::supervisor::{kill_process_tree, process_alive};
+                        if process_alive(pid) {
+                            let kg = supervisor
+                                .programs
+                                .get(&entry.name)
+                                .map(|h| h.config.killasgroup)
+                                .unwrap_or(false);
+                            kill_process_tree(pid, "KILL", kg);
+                        }
+                    }
+                    to_start.insert(entry.name);
+                }
+                ProgramState::Stopped => {
+                    // Explicitly stopped — honour that intent over config autostart.
+                    to_start.remove(&entry.name);
+                }
+                _ => {}
+            }
+        }
+    }
+    let to_start: Vec<String> = to_start.into_iter().collect();
+
     let (tx, rx) = mpsc::channel(QUEUE_SIZE);
     let tx_clone = tx.clone();
     tokio::spawn(actor_loop(supervisor, rx, tx_clone));
     let handle = RvisorHandle { tx, config_path };
-    // Queue up start commands for all autostart programs (using expanded names).
-    // We do this after spawning the actor so it can process them.
+    // Queue start commands after the actor is running so it can process them.
     let handle_clone = handle.clone();
     tokio::spawn(async move {
-        for name in autostart_names {
+        for name in to_start {
             let _ = handle_clone.start(Some(name)).await;
         }
     });
@@ -1083,6 +1127,24 @@ fn handle_shutdown(
 ) {
     // Reply immediately so the caller doesn't block.
     let _ = reply.send(Ok(()));
+
+    // Persist state before mutating anything to STOPPING, so the next daemon
+    // startup sees the true pre-shutdown states (RUNNING, STOPPED, etc.).
+    let state_path = persist::state_path(&sup.sock_path);
+    persist::save(
+        &state_path,
+        &persist::StateSnapshot {
+            programs: sup
+                .programs
+                .values()
+                .map(|h| persist::ProgramSnapshot {
+                    name: h.config.name.clone(),
+                    state: h.state.as_str().to_string(),
+                    pid: h.pid,
+                })
+                .collect(),
+        },
+    );
 
     // Collect stop info for all running programs before emitting events.
     let names: Vec<String> = sup.programs.keys().cloned().collect();

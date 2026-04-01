@@ -30,11 +30,13 @@ The daemon exposes a **Unix Domain Socket** (default `/tmp/rvisor.sock`). The pr
 | Module | Role |
 |--------|------|
 | `main.rs` | CLI entry point (clap), daemonization (double-fork), signal handling, async runtime setup |
-| `supervisor.rs` | Core state machine — holds all `ProgramState` instances, drives STOPPED→STARTING→RUNNING→BACKOFF→FATAL transitions, handles commands from IPC |
+| `actor.rs` | Actor loop that owns the `Rvisor` state machine; receives `Command` messages over an `mpsc` channel and dispatches them; the `RvisorHandle` is the only way external code interacts with the supervisor |
+| `supervisor.rs` | Pure state types (`ProgramState`, `ProgramStatus`, `ProgramHandle`, `Event`, `RereadSummary`, `UpdateSummary`, `ReloadSummary`) and the `Rvisor` struct with all transition logic |
 | `ipc.rs` | Unix socket server (daemon side) and client helpers (CLI side); handles streaming for log-tail and event-feed commands; config file watching via `notify` |
 | `process.rs` | Spawns child processes via Tokio, captures stdout/stderr, size-based log rotation |
-| `config.rs` | TOML parsing into `SupervisordConfig` / `ProgramConfig`; config search path logic |
-| `service.rs` | service manager integration for `systemd --user` (Linux) and `launchd` (macOS) |
+| `persist.rs` | State snapshot serialization — saves/loads `StateSnapshot` (JSON) at `<sock>.state` for daemon restart recovery |
+| `config.rs` | TOML parsing into `Config` / `ProgramConfig`; config search path logic |
+| `service.rs` | Service manager integration for `systemd --user` (Linux) and `launchd` (macOS) |
 | `logging.rs` | Initializes `tracing-subscriber` with `RUST_LOG` env filter (default: `info`) |
 
 ### Data Flow
@@ -70,11 +72,16 @@ Available `ctl` commands: `start`, `stop`, `restart`, `status`, `signal`, `rerea
 
 `ipc.rs` uses the `notify` crate to watch the directory containing the config file. On modification of the active config file, it triggers an automatic `reread` + `update` cycle inside the daemon.
 
+### Actor Pattern
+
+The supervisor uses the actor pattern to avoid shared-state concurrency. The actor loop runs in a dedicated Tokio task and is the single owner of `Rvisor` state. All external interactions go through typed `Command` variants with `oneshot` reply channels; `RvisorHandle` (a thin `mpsc::Sender<Command>` wrapper) is cloned and passed to the IPC layer.
+
 ### Tests
 
-Integration tests are in `tests/milestones.rs`. They start a real daemon process and communicate over the socket. A `tempfile`-backed config and socket path are used so tests are self-contained.
+- `tests/actor.rs` — actor/supervisor logic tests; spawn real child processes but no daemon.
+- `tests/milestones.rs` — end-to-end tests that start a real daemon and communicate over the socket; require a Unix environment. A `tempfile`-backed config and socket path keep them self-contained.
 
-Run integration tests (they require a Unix environment):
 ```bash
-cargo test --test milestones
+cargo test --test actor       # actor unit tests
+cargo test --test milestones  # integration tests
 ```

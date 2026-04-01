@@ -73,6 +73,22 @@ impl ProgramState {
     }
 }
 
+impl std::str::FromStr for ProgramState {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "STOPPED" => Ok(ProgramState::Stopped),
+            "STARTING" => Ok(ProgramState::Starting),
+            "RUNNING" => Ok(ProgramState::Running),
+            "BACKOFF" => Ok(ProgramState::Backoff),
+            "STOPPING" => Ok(ProgramState::Stopping),
+            "EXITED" => Ok(ProgramState::Exited),
+            "FATAL" => Ok(ProgramState::Fatal),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ProgramHandle {
     pub config: ProgramConfig,

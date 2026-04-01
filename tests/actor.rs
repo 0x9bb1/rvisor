@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rvisor::{actor, config};
+use rvisor::{actor, config, persist};
 
 fn make_program(name: &str, command: &str) -> config::ProgramConfig {
     config::ProgramConfig {
@@ -214,4 +214,86 @@ async fn events_subscribe_receives_state_transitions() {
 
     // Clean up
     let _ = handle.stop(Some("eta".to_string())).await;
+}
+
+/// A snapshot saying a program was RUNNING causes it to be started on the next
+/// daemon boot, even when `autostart: false` in the config.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_running_restarts_program_on_next_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("rvisor.sock");
+    let state_path = persist::state_path(&sock_path);
+
+    persist::save(
+        &state_path,
+        &persist::StateSnapshot {
+            programs: vec![persist::ProgramSnapshot {
+                name: "theta".to_string(),
+                state: "RUNNING".to_string(),
+                pid: None,
+            }],
+        },
+    );
+
+    // autostart:false — snapshot should override and trigger a start.
+    let prog = make_program("theta", "sleep 100");
+    let handle = actor::spawn_actor(
+        PathBuf::from("/tmp/test.toml"),
+        vec![prog],
+        HashMap::new(),
+        None,
+        sock_path,
+        None,
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let statuses = handle.status(Some("theta".to_string())).await.unwrap();
+    let state = &statuses[0].state;
+    assert!(
+        state == "RUNNING" || state == "STARTING",
+        "expected RUNNING or STARTING, got {state}"
+    );
+
+    let _ = handle.stop(Some("theta".to_string())).await;
+}
+
+/// A snapshot saying a program was STOPPED suppresses config `autostart: true`
+/// on the next daemon boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_stopped_suppresses_autostart() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("rvisor.sock");
+    let state_path = persist::state_path(&sock_path);
+
+    persist::save(
+        &state_path,
+        &persist::StateSnapshot {
+            programs: vec![persist::ProgramSnapshot {
+                name: "iota".to_string(),
+                state: "STOPPED".to_string(),
+                pid: None,
+            }],
+        },
+    );
+
+    // autostart:true in config, but snapshot says STOPPED — should win.
+    let mut prog = make_program("iota", "sleep 100");
+    prog.autostart = true;
+    let handle = actor::spawn_actor(
+        PathBuf::from("/tmp/test.toml"),
+        vec![prog],
+        HashMap::new(),
+        None,
+        sock_path,
+        None,
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let statuses = handle.status(Some("iota".to_string())).await.unwrap();
+    assert_eq!(
+        statuses[0].state, "STOPPED",
+        "snapshot STOPPED should override autostart:true"
+    );
 }
